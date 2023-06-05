@@ -1,0 +1,2 @@
+KW1="FUZZ"
+KW2="syzkaller\x00"

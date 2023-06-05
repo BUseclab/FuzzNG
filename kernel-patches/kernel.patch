@@ -1,0 +1,966 @@
+diff -urN linux-6.1/arch/x86/entry/common.c kernel/arch/x86/entry/common.c
+--- linux-6.1/arch/x86/entry/common.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/arch/x86/entry/common.c	2023-05-25 11:01:05.453766341 -0400
+@@ -72,6 +72,8 @@
+ 
+ __visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
+ {
++    int fe = current->fuzz_enabled;
++    current->fuzz_enabled = 0;
+ 	add_random_kstack_offset();
+ 	nr = syscall_enter_from_user_mode(regs, nr);
+ 
+@@ -84,6 +86,7 @@
+ 
+ 	instrumentation_end();
+ 	syscall_exit_to_user_mode(regs);
++    current->fuzz_enabled = fe;
+ }
+ #endif
+ 
+diff -urN linux-6.1/arch/x86/include/asm/uaccess.h kernel/arch/x86/include/asm/uaccess.h
+--- linux-6.1/arch/x86/include/asm/uaccess.h	2022-12-11 17:15:18.000000000 -0500
++++ kernel/arch/x86/include/asm/uaccess.h	2023-05-25 07:48:40.279083833 -0400
+@@ -8,6 +8,7 @@
+ #include <linux/instrumented.h>
+ #include <linux/kasan-checks.h>
+ #include <linux/string.h>
++#include <linux/fuzzer_dev.h>
+ #include <asm/asm.h>
+ #include <asm/page.h>
+ #include <asm/smap.h>
+@@ -99,6 +100,7 @@
+ ({									\
+ 	int __ret_gu;							\
+ 	register __inttype(*(ptr)) __val_gu asm("%"_ASM_DX);		\
++    fuzz_copy_from_user_cb((size_t)ptr, sizeof(*(ptr)), 0);\
+ 	__chk_user_ptr(ptr);						\
+ 	asm volatile("call __" #fn "_%P4"				\
+ 		     : "=a" (__ret_gu), "=r" (__val_gu),		\
+diff -urN linux-6.1/arch/x86/kernel/dumpstack.c kernel/arch/x86/kernel/dumpstack.c
+--- linux-6.1/arch/x86/kernel/dumpstack.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/arch/x86/kernel/dumpstack.c	2023-05-25 07:48:40.279083833 -0400
+@@ -18,6 +18,7 @@
+ #include <linux/nmi.h>
+ #include <linux/sysfs.h>
+ #include <linux/kasan.h>
++#include <linux/fuzzer_dev.h>
+ 
+ #include <asm/cpu_entry_area.h>
+ #include <asm/stacktrace.h>
+@@ -192,6 +193,7 @@
+ 	int graph_idx = 0;
+ 	bool partial = false;
+ 
++    fuzz_track_show_trace();
+ 	printk("%sCall Trace:\n", log_lvl);
+ 
+ 	unwind_start(&state, task, regs, stack);
+diff -urN linux-6.1/arch/x86/kernel/traps.c kernel/arch/x86/kernel/traps.c
+--- linux-6.1/arch/x86/kernel/traps.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/arch/x86/kernel/traps.c	2023-05-25 07:48:40.279083833 -0400
+@@ -41,6 +41,7 @@
+ #include <linux/hardirq.h>
+ #include <linux/atomic.h>
+ #include <linux/ioasid.h>
++#include <linux/fuzzer_dev.h>
+ 
+ #include <asm/stacktrace.h>
+ #include <asm/processor.h>
+@@ -772,6 +773,7 @@
+ 			 (hint == GP_NON_CANONICAL) ? "probably for non-canonical address"
+ 						    : "maybe for address",
+ 			 gp_addr);
++    fuzz_track_show_trace();
+ 
+ 	/*
+ 	 * KASAN is interested only in the non-canonical case, clear it
+diff -urN linux-6.1/fs/file.c kernel/fs/file.c
+--- linux-6.1/fs/file.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/fs/file.c	2023-05-25 07:48:40.279083833 -0400
+@@ -259,6 +259,7 @@
+ 
+ static inline void __set_open_fd(unsigned int fd, struct fdtable *fdt)
+ {
++    fuzz_open_fd_cb(fd);
+ 	__set_bit(fd, fdt->open_fds);
+ 	fd /= BITS_PER_LONG;
+ 	if (!~fdt->open_fds[fd])
+@@ -918,6 +919,7 @@
+ 
+ static inline struct file *__fget(unsigned int fd, fmode_t mask)
+ {
++    fuzz_fget_cb(fd);
+ 	return __fget_files(current->files, fd, mask);
+ }
+ 
+@@ -1002,6 +1004,7 @@
+ {
+ 	struct files_struct *files = current->files;
+ 	struct file *file;
++    fuzz_fget_cb(fd);
+ 
+ 	/*
+ 	 * If another thread is concurrently calling close_fd() followed
+@@ -1212,7 +1215,7 @@
+ }
+ EXPORT_SYMBOL_GPL(receive_fd);
+ 
+-static int ksys_dup3(unsigned int oldfd, unsigned int newfd, int flags)
++int ksys_dup3(unsigned int oldfd, unsigned int newfd, int flags)
+ {
+ 	int err = -EBADF;
+ 	struct file *file;
+diff -urN linux-6.1/include/linux/fuzzer_dev.h kernel/include/linux/fuzzer_dev.h
+--- linux-6.1/include/linux/fuzzer_dev.h	1969-12-31 19:00:00.000000000 -0500
++++ kernel/include/linux/fuzzer_dev.h	2023-05-25 07:48:40.279083833 -0400
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _LINUX_INSTRUMENTED_H
++#include <linux/mm_types.h>
++#include <linux/sched.h>
++void fuzz_set_kcov_vma(unsigned long addr, unsigned long size,
++                       void *area, struct vm_area_struct *vma);
++void fuzz_task_init(struct task_struct *t);
++#endif
++
++#ifndef _LINUX_FUZZER_DEV_H
++#define _LINUX_FUZZER_DEV_H
++
++#define FUZZ_BASE 0x922
++enum {
++    FUZZ_DEVICE_MAKE_SNAPSHOT = 0,
++    FUZZ_DEVICE_ADD_CMP_ARRAY=12,
++    FUZZ_DEVICE_RESET=16,
++    FUZZ_DEVICE_ADD_INPUT_REGION=20,
++    FUZZ_DEVICE_GET_INPUT=24,
++    FUZZ_DEVICE_ADD_OUTPUT_REGION=28,
++    FUZZ_DEVICE_ADD_REMOTE_COV_ARRAY=32,
++    FUZZ_DEVICE_ADD_PFN_BASE=36,
++    FUZZ_DEVICE_ADD_PFN_SIZE=40,
++    FUZZ_DEVICE_SHOW_TRACE=44,
++    FUZZ_DEVICE_SET_KCOV_TIMER=48,
++    FUZZ_DEVICE_ADD_SYSCALL_LOG=52,
++    FUZZ_DEVICE_ADD_STR0=56,
++    FUZZ_DEVICE_ADD_STR1=60,
++    FUZZ_DEVICE_STRCMP=64,
++    FUZZ_DEVICE_ABORT_INPUT=68,
++    FUZZ_DEVICE_OPS_END
++};
++
++int fuzz_copy_from_user_cb(size_t addr, size_t len, int write); 
++void fuzz_track_show_trace(void);
++int fuzz_open_fd_cb(unsigned int fd);
++int fuzz_fget_cb(unsigned int fd);
++int fuzz_copy_from_user_cb(size_t addr, size_t len, int write);
++int fuzz_strncpy_from_user_cb(size_t addr, size_t maxlen, int write);
++void fuzz_kthread_cb(int create);
++void fuzz_signal_cb(int sig);
++void fuzz_trace_strcmp(uint32_t caller, const char *cs, const char *ct);
++void fuzz_track_pfn_range(unsigned long pfn, unsigned long size);
++
++extern int fuzz_enabled;
++
++#endif
+diff -urN linux-6.1/include/linux/instrumented.h kernel/include/linux/instrumented.h
+--- linux-6.1/include/linux/instrumented.h	2022-12-11 17:15:18.000000000 -0500
++++ kernel/include/linux/instrumented.h	2023-05-25 07:48:40.279083833 -0400
+@@ -12,6 +12,7 @@
+ #include <linux/kcsan-checks.h>
+ #include <linux/kmsan-checks.h>
+ #include <linux/types.h>
++#include <linux/fuzzer_dev.h>
+ 
+ /**
+  * instrument_read - instrument regular read access
+@@ -116,6 +117,7 @@
+ static __always_inline void
+ instrument_copy_to_user(void __user *to, const void *from, unsigned long n)
+ {
++    fuzz_copy_from_user_cb((size_t)to, n, true);
+ 	kasan_check_read(from, n);
+ 	kcsan_check_read(from, n);
+ 	kmsan_copy_to_user(to, from, n, 0);
+@@ -134,6 +136,7 @@
+ static __always_inline void
+ instrument_copy_from_user_before(const void *to, const void __user *from, unsigned long n)
+ {
++    fuzz_copy_from_user_cb((size_t)from, n, false);
+ 	kasan_check_write(to, n);
+ 	kcsan_check_write(to, n);
+ }
+diff -urN linux-6.1/include/linux/sched.h kernel/include/linux/sched.h
+--- linux-6.1/include/linux/sched.h	2022-12-11 17:15:18.000000000 -0500
++++ kernel/include/linux/sched.h	2023-05-25 07:48:40.279083833 -0400
+@@ -1428,6 +1428,8 @@
+ 	/* Collect coverage from softirq context: */
+ 	unsigned int			kcov_softirq;
+ #endif
++    int fuzz_enabled;
++    void* fuzz_dev;
+ 
+ #ifdef CONFIG_MEMCG
+ 	struct mem_cgroup		*memcg_in_oom;
+diff -urN linux-6.1/include/linux/uaccess.h kernel/include/linux/uaccess.h
+--- linux-6.1/include/linux/uaccess.h	2022-12-11 17:15:18.000000000 -0500
++++ kernel/include/linux/uaccess.h	2023-05-25 07:48:40.279083833 -0400
+@@ -100,6 +100,9 @@
+ {
+ 	if (should_fail_usercopy())
+ 		return n;
++    if(fuzz_copy_from_user_cb((size_t)to, n, 1)){
++        return 0;
++    }
+ 	instrument_copy_to_user(to, from, n);
+ 	check_object_size(from, n, true);
+ 	return raw_copy_to_user(to, from, n);
+@@ -111,6 +114,9 @@
+ 	might_fault();
+ 	if (should_fail_usercopy())
+ 		return n;
++    if(fuzz_copy_from_user_cb((size_t)to, n, 1)){
++        return 0;
++    }
+ 	instrument_copy_to_user(to, from, n);
+ 	check_object_size(from, n, true);
+ 	return raw_copy_to_user(to, from, n);
+@@ -144,6 +150,8 @@
+ 	if (should_fail_usercopy())
+ 		return n;
+ 	if (access_ok(to, n)) {
++        if(fuzz_copy_from_user_cb(to, n, 1))
++            return 0;
+ 		instrument_copy_to_user(to, from, n);
+ 		n = raw_copy_to_user(to, from, n);
+ 	}
+diff -urN linux-6.1/kernel/exit.c kernel/kernel/exit.c
+--- linux-6.1/kernel/exit.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/kernel/exit.c	2023-05-25 08:22:38.158934313 -0400
+@@ -755,11 +755,13 @@
+ 	spin_unlock_irq(&sighand->siglock);
+ }
+ 
++void fuzz_exit_cb(void);
+ void __noreturn do_exit(long code)
+ {
+ 	struct task_struct *tsk = current;
+ 	int group_dead;
+ 
++    fuzz_exit_cb();
+ 	synchronize_group_exit(tsk, code);
+ 
+ 	WARN_ON(tsk->plug);
+diff -urN linux-6.1/kernel/fork.c kernel/kernel/fork.c
+--- linux-6.1/kernel/fork.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/kernel/fork.c	2023-05-25 07:48:40.279083833 -0400
+@@ -97,6 +97,7 @@
+ #include <linux/scs.h>
+ #include <linux/io_uring.h>
+ #include <linux/bpf.h>
++#include <linux/fuzzer_dev.h>
+ 
+ #include <asm/pgalloc.h>
+ #include <linux/uaccess.h>
+@@ -109,6 +110,9 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/task.h>
+ 
++
++void fuzz_task_init(struct task_struct *t);
++
+ /*
+  * Minimum number of threads to boot the kernel
+  */
+@@ -1022,6 +1026,7 @@
+ 	tsk->wake_q.next = NULL;
+ 	tsk->worker_private = NULL;
+ 
++    fuzz_task_init(tsk);
+ 	kcov_task_init(tsk);
+ 	kmsan_task_create(tsk);
+ 	kmap_local_fork(tsk);
+diff -urN linux-6.1/kernel/fuzzer_dev.c kernel/kernel/fuzzer_dev.c
+--- linux-6.1/kernel/fuzzer_dev.c	1969-12-31 19:00:00.000000000 -0500
++++ kernel/kernel/fuzzer_dev.c	2023-05-26 04:31:54.931954228 -0400
+@@ -0,0 +1,400 @@
++#include <linux/fdtable.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/hashtable.h>
++#include <linux/ioctl.h>
++#include <linux/kfifo.h>
++#include <linux/mman.h>
++#include <linux/module.h>
++#include <linux/pagewalk.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/thread_info.h>
++#include <linux/wait.h>
++#include <linux/syscalls.h>
++#include <linux/fuzzer_dev.h>
++#include <asm/io.h>
++
++#define SUCCESS 0
++#define DEVICE_NAME "fuzzer" /* Dev name as it appears in /proc/devices */
++
++#define FUZZ_DEBUG 0
++#define debug_printk(fmt, ...)\
++    do { \
++        if (FUZZ_DEBUG){ \
++            printk(fmt, __VA_ARGS__); \
++        } \
++    } while (0)
++
++#define MAGIC 'k'
++#define WATCH _IO(MAGIC, 1)
++#define STOPWATCH _IO(MAGIC, 2)
++#define FUZZINGSTAGE _IO(MAGIC, 3)
++#define SET_REVERSE_FD_OFFSET _IO(MAGIC, 5)
++#define CLEANUP _IO(MAGIC, 6)
++#define GET_CFU_DETAILS _IOW(MAGIC, 7, struct cfu_details)
++#define COMPLETE_CFU _IO(MAGIC, 8)
++
++static int Major;
++
++DECLARE_WAIT_QUEUE_HEAD(wait_queue_fuzz_data);
++
++struct cfu_details {void* addr; size_t len; int string;} cfu_details;
++
++int fuzz_enabled = 0;
++uint64_t last_kcov_write; 
++
++typedef struct fuzzer_dev {
++
++    int open_fds[100];
++    int open_fds_len;
++    int reverse_fd_offset; // Which fd from the end will be used for dups
++    int fd_duped;          // Have we already duped since the last syscall?
++
++    int mapped_index;
++    unsigned long kcov_addr;
++    unsigned long kcov_size;
++    void *kcov_area;
++    struct vm_area_struct *kcov_vma;
++    int fuzzing_stage;
++
++    int wait_queue_flag;
++	struct wait_queue_head	cfu_poll_wq;
++    struct completion cfu_completion;
++    struct mutex cfu_mutex;
++    struct cfu_details cfu_details;
++} fuzzer_dev;
++
++
++void fuzz_set_kcov_vma(unsigned long addr, unsigned long size,
++                       void *area, struct vm_area_struct *vma)
++{
++    fuzzer_dev *d = current->fuzz_dev;
++    if(!d)
++        return;
++    d->kcov_vma = vma;
++    d->kcov_addr = addr;
++    d->kcov_size = size;
++    d->kcov_area = area;
++}
++
++
++void fuzz_exit_cb(void){
++    if(current->fuzz_enabled)
++        outl(1, 0x922 + FUZZ_DEVICE_RESET);
++}
++void fuzz_alloc_cb(size_t size){
++    if (!current->fuzz_enabled)
++        return;
++    printk("ALLOC: %lx\n", size);
++}
++
++int fuzz_open_fd_cb(unsigned int fd)
++{
++    fuzzer_dev *d = current->fuzz_dev;
++    if (!current->fuzz_enabled || fd < 3)
++        return 0;
++
++    debug_printk("OPEN: %d %d %d %d\n", fd, d->open_fds_len, sizeof(d->open_fds), sizeof(d->open_fds[0]));
++    if (d->open_fds_len == sizeof(d->open_fds) / sizeof(d->open_fds[0])) {
++        return 0;
++    }
++    d->open_fds[d->open_fds_len++] = fd;
++    if (d->open_fds_len == sizeof(d->open_fds) / sizeof(d->open_fds[0])) {
++        printk("FD Array Full\n");
++    }
++    debug_printk("OPEN ADDED: %d\n", fd);
++    return 0;
++}
++
++extern int ksys_dup3(unsigned int oldfd, unsigned int newfd, int flags);
++
++void fuzz_signal_cb(int sig) {
++    const struct pt_regs *user_regs = task_pt_regs(current);
++    unsigned long ip = user_regs->ip;
++    printk("GOT SIGNAL %d @ %lx\n", sig, ip);
++
++    if(sig==11)
++        outl(1, 0x922 + FUZZ_DEVICE_RESET);
++}
++
++int fuzz_fget_cb(unsigned int fd)
++{
++    int index;
++    fuzzer_dev *d = current->fuzz_dev;
++    static int limit = 0;
++    int ret;
++
++    if (!current->fuzz_enabled)
++        return 0;
++    
++    if (!d->fuzzing_stage)
++        return 0;
++
++    debug_printk("Get FD: %lx (%d open)\n", fd, d->open_fds_len);
++
++    if (!d->open_fds_len)
++        return 0;
++    if(limit++ >= 50 )
++        return 0 ;
++
++    current->fuzz_enabled = 0;
++    if(files_lookup_fd_raw(current->files, fd)){
++        current->fuzz_enabled = 1;
++        return 0;
++    }
++    current->fuzz_enabled = 1;
++
++    /*
++     * Two possibilities:
++     * 1. No FD has already been duped since the last time we enabled the
++     * fuzzer hooks (i.e. started running a new syscall).
++     * 2. Some FD has already been duped ...
++     *
++     * In the first case, reverse index into the fd array to pull-out an FD for
++     * duping.
++     *
++     * In the second case, use the fd number passed to this function as a
++     * modulo index into the fd array 
++     */
++    if (d->fd_duped) {
++        index = d->open_fds_len - 1 - d->reverse_fd_offset;
++    } else {
++        index = d->open_fds_len;
++        index = fd % d->open_fds_len;
++    }
++    while(index >= 0){
++        if(files_lookup_fd_raw(current->files, d->open_fds[index]))
++            break;
++        index--;
++    }
++    if(index < 0){
++        current->fuzz_enabled = 1;
++        return 0;
++    }
++
++    current->fuzz_enabled = 0;
++    ret = ksys_dup3(d->open_fds[index], fd, 0);
++    current->fuzz_enabled = 1;
++
++    d->fd_duped = 1;
++    debug_printk("DUP: %d(0x%x) -> %d(%x) = %d\n", d->open_fds[index],d->open_fds[index], fd, fd, ret);
++    return 0;
++}
++
++static int copy_from_user_cb(size_t addr, size_t len, int write, int string) {
++    int ret = 0;
++    fuzzer_dev *d = current->fuzz_dev;
++    struct vm_area_struct *vma;
++
++    if (!current->fuzz_enabled)
++        return ret;
++    if (!d->fuzzing_stage)
++        return ret;
++    if(in_atomic())
++        return ret;
++    current->fuzz_enabled = 0;
++
++    if (write) {
++        ret = 1;
++    } else {
++        if (__virt_addr_valid(addr))
++            goto out;
++        vma = vma_lookup(current->mm, addr);
++        if (!vma)
++            goto out;
++        if(!(vma->vm_flags & VM_WRITE))
++            goto out;
++
++
++        // Only allow one thread to be waiting for a cfu response, at a time
++        if (mutex_lock_interruptible(&d->cfu_mutex))
++            return -ERESTARTSYS;
++        debug_printk("CFUCB: %lx %lx\n", addr, len);
++		d->cfu_details.addr = (void*)addr;
++		d->cfu_details.len =  len;
++        d->cfu_details.string = string;
++
++		d->wait_queue_flag = 1;
++		wake_up_interruptible(&d->cfu_poll_wq);
++
++		wait_for_completion(&d->cfu_completion);
++        mutex_unlock(&d->cfu_mutex);
++        debug_printk("CFUCB DONE: %lx %lx\n", addr, len);
++    }
++
++out:
++    current->fuzz_enabled = 1;
++    return ret;
++
++}
++
++int fuzz_strncpy_from_user_cb(size_t addr, size_t maxlen, int write) {
++    return copy_from_user_cb(addr, maxlen, write, true);
++}
++
++int fuzz_copy_from_user_cb(size_t addr, size_t len, int write) {
++    return copy_from_user_cb(addr, len, write, false);
++}
++
++
++static char str0[256];
++static char str1[256];
++
++void fuzz_trace_strcmp(uint32_t caller, const char *cs, const char *ct){
++    if(!current || !current->fuzz_enabled)
++        return;
++    if(strlen(cs) <1 || strlen(ct)<1){
++        return;
++    }
++    strncpy(str0, cs, 255);
++    strncpy(str1, ct, 255);
++    outl(caller, FUZZ_BASE + FUZZ_DEVICE_STRCMP);
++}
++
++static int device_open(struct inode *inode, struct file *f)
++{
++    struct fuzzer_dev *d;
++    uint64_t phys_addr = virt_to_phys(&last_kcov_write);
++    printk("KCOV Physaddr is %lx\n", phys_addr);
++    outl(phys_addr, FUZZ_BASE + FUZZ_DEVICE_SET_KCOV_TIMER);
++    
++    phys_addr = virt_to_phys(&str0);
++    printk("STR0 Physaddr is %lx\n", phys_addr);
++    outl(phys_addr, FUZZ_BASE + FUZZ_DEVICE_ADD_STR0);
++    phys_addr = virt_to_phys(&str1);
++    printk("STR1 Physaddr is %lx\n", phys_addr);
++    outl(phys_addr, FUZZ_BASE + FUZZ_DEVICE_ADD_STR1);
++
++    d = kzalloc(sizeof *d, GFP_KERNEL | __GFP_RETRY_MAYFAIL);
++    if (!d) {
++        return -ENOMEM;
++    }
++    f->private_data = d;
++    current->fuzz_dev = d;
++	init_waitqueue_head(&d->cfu_poll_wq);
++	init_completion(&d->cfu_completion);
++    mutex_init(&d->cfu_mutex);
++    return SUCCESS;
++}
++
++void fuzz_track_show_trace(void) {
++    outl(1,  FUZZ_BASE + FUZZ_DEVICE_SHOW_TRACE);
++}
++
++void fuzz_track_pfn_range(unsigned long pfn, unsigned long size)
++{
++    //outl(pfn,  FUZZ_BASE + FUZZ_DEVICE_ADD_PFN_BASE);
++    //outl(size, FUZZ_BASE + FUZZ_DEVICE_ADD_PFN_SIZE);
++}
++
++
++static int device_release(struct inode *inode, struct file *f)
++{
++    outl(1, 0x922 + FUZZ_DEVICE_RESET);
++    current->fuzz_enabled = 0;
++    kvfree(f->private_data);
++    current->fuzz_dev = NULL;
++    return 0;
++}
++
++
++static long fuzz_device_ioctl(struct file *f, unsigned int ioctl, unsigned long arg)
++{
++    void __user *argp = (void __user *)arg;
++    fuzzer_dev *d = f->private_data;
++    switch (ioctl) {
++    case WATCH:
++        last_kcov_write = 0;
++        debug_printk("%s", "WATCH\n");
++        current->fuzz_enabled = 1;
++        fuzz_enabled = 1;
++        d->fd_duped = 0;
++        if (d->kcov_addr && current->kcov) {
++            d->kcov_vma->vm_flags &= ~VM_WRITE;
++            vma_set_page_prot(d->kcov_vma);
++        }
++        break;
++    case STOPWATCH:
++        current->fuzz_enabled = 0;
++        debug_printk("%s", "STOPWATCH\n");
++        if (d->kcov_addr && current->kcov) {
++            d->kcov_vma->vm_flags |= VM_WRITE;
++            vma_set_page_prot(d->kcov_vma);
++        }
++        break;
++    case FUZZINGSTAGE:
++        debug_printk("%s", "FUZZING_STAGE\n");
++        d->fuzzing_stage = 1;
++        break;
++
++
++    case SET_REVERSE_FD_OFFSET:
++    /*
++     * Set the reverse fd offset (used to fill dups), relative to the order in
++     * which the fds were opened.
++     */
++        if(d->open_fds_len) {
++            d->reverse_fd_offset = (arg % d->open_fds_len);
++            debug_printk("Returning FD offset %d\n", d->open_fds_len - d->reverse_fd_offset - 1);
++            return d->open_fds_len - d->reverse_fd_offset - 1;
++        } else {
++            debug_printk("%s", "No FDs found to set revese offset");
++        }
++        break;
++    case CLEANUP:
++        d->open_fds_len = 0;
++        break;
++    case GET_CFU_DETAILS:
++        //wait_event_interruptible(d->cfu_poll_wq, d->wait_queue_flag != 0);
++        d->wait_queue_flag = 0;
++        if (copy_to_user(argp, &d->cfu_details, sizeof(d->cfu_details)))
++            debug_printk("fuzz: cfu failed %lx %lx\n", argp, sizeof(d->cfu_details));
++        break;
++    case COMPLETE_CFU:
++        complete(&d->cfu_completion);
++        break;
++    }
++    return 0;
++}
++
++static unsigned int fuzz_poll(struct file *file, poll_table *wait)
++{
++    fuzzer_dev *d = file->private_data;
++    poll_wait(file, &d->cfu_poll_wq, wait);
++    if (d->wait_queue_flag)
++        return POLLIN | POLLRDNORM;
++    return 0;
++}
++
++
++static struct file_operations fops = {
++    .unlocked_ioctl = fuzz_device_ioctl,
++    .open = device_open,
++    .poll = fuzz_poll,
++    .release = device_release,
++};
++
++void fuzz_task_init(struct task_struct *t)
++{
++    t->fuzz_dev = current->fuzz_dev;
++}
++
++static int register_user_access_cd(void)
++{
++    Major = register_chrdev(0, DEVICE_NAME, &fops);
++
++    if (Major < 0) {
++        printk(KERN_ALERT "Registering char device failed with %d\n", Major);
++    }
++
++    printk(KERN_INFO "I was assigned major number %d. To talk to\n", Major);
++    printk(KERN_INFO "the driver, create a dev file with\n");
++    printk(KERN_INFO "'mknod /dev/%s c %d 0'.\n", DEVICE_NAME, Major);
++    printk(KERN_INFO "Try various minor numbers. Try to cat and echo to\n");
++    printk(KERN_INFO "the device file.\n");
++    printk(KERN_INFO "Remove the device file and module when done.\n");
++
++    return 0;
++}
++module_init(register_user_access_cd)
+diff -urN linux-6.1/kernel/kcov.c kernel/kernel/kcov.c
+--- linux-6.1/kernel/kcov.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/kernel/kcov.c	2023-05-25 07:48:40.279083833 -0400
+@@ -2,6 +2,7 @@
+ #define pr_fmt(fmt) "kcov: " fmt
+ 
+ #define DISABLE_BRANCH_PROFILING
++#include <linux/fuzzer_dev.h>
+ #include <linux/atomic.h>
+ #include <linux/compiler.h>
+ #include <linux/errno.h>
+@@ -25,6 +26,7 @@
+ #include <linux/refcount.h>
+ #include <linux/log2.h>
+ #include <asm/setup.h>
++#include <asm/io.h>
+ 
+ #define kcov_debug(fmt, ...) pr_debug("%s: " fmt, __func__, ##__VA_ARGS__)
+ 
+@@ -192,6 +194,7 @@
+ 	return ip;
+ }
+ 
++extern uint64_t last_kcov_write;
+ /*
+  * Entry point from instrumented code.
+  * This is called once per basic-block/edge.
+@@ -208,6 +211,10 @@
+ 		return;
+ 
+ 	area = t->kcov_area;
++    //last_kcov_write=get_cycles();
++
++    //ip &= (0xFFFFFFFF);
++    //ip |= ((last_kcov_write&0xFFFFFFFFLL) << 32);
+ 	/* The first 64-bit word is the number of subsequent PCs. */
+ 	pos = READ_ONCE(area[0]) + 1;
+ 	if (likely(pos < t->kcov_size)) {
+@@ -313,6 +320,13 @@
+ }
+ EXPORT_SYMBOL(__sanitizer_cov_trace_const_cmp8);
+ 
++void __sanitizer_cov_trace_gep(uintptr_t Idx)
++{
++	write_comp_data(KCOV_CMP_SIZE(3), Idx, 0,
++			_RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_gep);
++
+ void notrace __sanitizer_cov_trace_switch(u64 val, u64 *cases)
+ {
+ 	u64 i;
+@@ -498,6 +512,7 @@
+ 			return res;
+ 		}
+ 	}
++    fuzz_set_kcov_vma(vma->vm_start, size, kcov->area, vma);
+ 	return 0;
+ exit:
+ 	spin_unlock_irqrestore(&kcov->lock, flags);
+@@ -521,6 +536,10 @@
+ 
+ static int kcov_close(struct inode *inode, struct file *filep)
+ {
++    if(current->fuzz_dev) {
++        outl(1, FUZZ_BASE + FUZZ_DEVICE_RESET);
++        dump_stack();
++    }
+ 	kcov_put(filep->private_data);
+ 	return 0;
+ }
+diff -urN linux-6.1/kernel/Makefile kernel/kernel/Makefile
+--- linux-6.1/kernel/Makefile	2022-12-11 17:15:18.000000000 -0500
++++ kernel/kernel/Makefile	2023-05-25 07:48:40.279083833 -0400
+@@ -116,6 +116,8 @@
+ obj-$(CONFIG_HAVE_STATIC_CALL_INLINE) += static_call_inline.o
+ obj-$(CONFIG_CFI_CLANG) += cfi.o
+ 
++obj-y += fuzzer_dev.o
++
+ obj-$(CONFIG_PERF_EVENTS) += events/
+ 
+ obj-$(CONFIG_USER_RETURN_NOTIFIER) += user-return-notifier.o
+diff -urN linux-6.1/kernel/signal.c kernel/kernel/signal.c
+--- linux-6.1/kernel/signal.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/kernel/signal.c	2023-05-25 07:48:40.279083833 -0400
+@@ -1223,7 +1223,11 @@
+ 	/* Should SIGKILL or SIGSTOP be received by a pid namespace init? */
+ 	bool force = false;
+ 
+-	if (info == SEND_SIG_NOINFO) {
++    if (current->fuzz_dev) {
++        fuzz_signal_cb(sig);
++    }
++
++    if (info == SEND_SIG_NOINFO) {
+ 		/* Force if sent from an ancestor pid namespace */
+ 		force = !task_pid_nr_ns(current, task_active_pid_ns(t));
+ 	} else if (info == SEND_SIG_PRIV) {
+diff -urN linux-6.1/kernel/time/timer.c kernel/kernel/time/timer.c
+--- linux-6.1/kernel/time/timer.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/kernel/time/timer.c	2023-05-25 07:48:40.279083833 -0400
+@@ -1927,6 +1927,11 @@
+ 		}
+ 	}
+ 
++    if(current){
++        if(current && current->fuzz_enabled && timeout > 10000000){
++            return 0;
++        }
++    }
+ 	expire = timeout + jiffies;
+ 
+ 	timer.task = current;
+diff -urN linux-6.1/lib/iov_iter.c kernel/lib/iov_iter.c
+--- linux-6.1/lib/iov_iter.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/lib/iov_iter.c	2023-05-25 07:48:40.279083833 -0400
+@@ -166,6 +166,8 @@
+ 	if (should_fail_usercopy())
+ 		return n;
+ 	if (access_ok(to, n)) {
++        if(fuzz_copy_from_user_cb((size_t)to, n, 1))
++            return 0;
+ 		instrument_copy_to_user(to, from, n);
+ 		n = raw_copy_to_user(to, from, n);
+ 	}
+@@ -537,6 +539,8 @@
+ static int copyout_mc(void __user *to, const void *from, size_t n)
+ {
+ 	if (access_ok(to, n)) {
++        if(fuzz_copy_from_user_cb((size_t)to, n, 1))
++            return 0;
+ 		instrument_copy_to_user(to, from, n);
+ 		n = copy_mc_to_user((__force void *) to, from, n);
+ 	}
+diff -urN linux-6.1/lib/string.c kernel/lib/string.c
+--- linux-6.1/lib/string.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/lib/string.c	2023-05-25 07:48:40.279083833 -0400
+@@ -348,13 +348,17 @@
+  */
+ int strcmp(const char *cs, const char *ct)
+ {
++    const char *css=cs;
++    const char *ctt=ct;
+ 	unsigned char c1, c2;
+ 
+ 	while (1) {
+ 		c1 = *cs++;
+ 		c2 = *ct++;
+-		if (c1 != c2)
++		if (c1 != c2) {
++            fuzz_trace_strcmp((uint32_t)_RET_IP_, css, ctt);
+ 			return c1 < c2 ? -1 : 1;
++        }
+ 		if (!c1)
+ 			break;
+ 	}
+@@ -372,13 +376,17 @@
+  */
+ int strncmp(const char *cs, const char *ct, size_t count)
+ {
++    const char *css=cs;
++    const char *ctt=ct;
+ 	unsigned char c1, c2;
+ 
+ 	while (count) {
+ 		c1 = *cs++;
+ 		c2 = *ct++;
+-		if (c1 != c2)
++		if (c1 != c2){
++            fuzz_trace_strcmp((uint32_t)_RET_IP_, css, ctt);
+ 			return c1 < c2 ? -1 : 1;
++        }
+ 		if (!c1)
+ 			break;
+ 		count--;
+diff -urN linux-6.1/lib/strncpy_from_user.c kernel/lib/strncpy_from_user.c
+--- linux-6.1/lib/strncpy_from_user.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/lib/strncpy_from_user.c	2023-05-25 07:48:40.279083833 -0400
+@@ -135,6 +135,7 @@
+ 
+ 		kasan_check_write(dst, count);
+ 		check_object_size(dst, count, false);
++        fuzz_strncpy_from_user_cb((size_t)src, count-1, 0);
+ 		if (user_read_access_begin(src, max)) {
+ 			retval = do_strncpy_from_user(dst, src, count, max);
+ 			user_read_access_end();
+diff -urN linux-6.1/lib/usercopy.c kernel/lib/usercopy.c
+--- linux-6.1/lib/usercopy.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/lib/usercopy.c	2023-05-25 07:48:40.279083833 -0400
+@@ -30,6 +30,8 @@
+ 	if (should_fail_usercopy())
+ 		return n;
+ 	if (likely(access_ok(to, n))) {
++        if(fuzz_copy_from_user_cb((size_t)to, n, 1))
++            return 0;
+ 		instrument_copy_to_user(to, from, n);
+ 		n = raw_copy_to_user(to, from, n);
+ 	}
+@@ -63,6 +65,8 @@
+ 	from -= align;
+ 	size += align;
+ 
++    fuzz_copy_from_user_cb((size_t)from, size, false);
++
+ 	if (!user_read_access_begin(from, size))
+ 		return -EFAULT;
+ 
+diff -urN linux-6.1/mm/memory.c kernel/mm/memory.c
+--- linux-6.1/mm/memory.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/mm/memory.c	2023-05-25 07:48:40.279083833 -0400
+@@ -2555,6 +2555,12 @@
+ 	err = remap_pfn_range_notrack(vma, addr, pfn, size, prot);
+ 	if (err)
+ 		untrack_pfn(vma, pfn, PAGE_ALIGN(size));
++
++    // Tell the fuzzer virtual-device to track all reads from this pfn range
++    // (they can contain user-controlled data)
++    if (current->fuzz_enabled){
++        fuzz_track_pfn_range(pfn, size>>PAGE_SHIFT);
++    }
+ 	return err;
+ }
+ EXPORT_SYMBOL(remap_pfn_range);
+diff -urN linux-6.1/scripts/Makefile.kcov kernel/scripts/Makefile.kcov
+--- linux-6.1/scripts/Makefile.kcov	2022-12-11 17:15:18.000000000 -0500
++++ kernel/scripts/Makefile.kcov	2023-05-25 07:48:40.275083891 -0400
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ kcov-flags-$(CONFIG_CC_HAS_SANCOV_TRACE_PC)	+= -fsanitize-coverage=trace-pc
+-kcov-flags-$(CONFIG_KCOV_ENABLE_COMPARISONS)	+= -fsanitize-coverage=trace-cmp
++kcov-flags-$(CONFIG_KCOV_ENABLE_COMPARISONS)	+= -fsanitize-coverage=trace-cmp -fsanitize-coverage=trace-gep
+ kcov-flags-$(CONFIG_GCC_PLUGIN_SANCOV)		+= -fplugin=$(objtree)/scripts/gcc-plugins/sancov_plugin.so
+ 
+ export CFLAGS_KCOV := $(kcov-flags-y)
+diff -urN linux-6.1/tools/objtool/check.c kernel/tools/objtool/check.c
+--- linux-6.1/tools/objtool/check.c	2022-12-11 17:15:18.000000000 -0500
++++ kernel/tools/objtool/check.c	2023-05-25 07:48:40.275083891 -0400
+@@ -1061,6 +1061,7 @@
+ 	"__sanitizer_cov_trace_cmp2",
+ 	"__sanitizer_cov_trace_cmp4",
+ 	"__sanitizer_cov_trace_cmp8",
++	"__sanitizer_cov_trace_gep",
+ 	"__sanitizer_cov_trace_switch",
+ 	/* KMSAN */
+ 	"kmsan_copy_to_user",
+diff -urN linux-6.1/whitelist kernel/whitelist
+--- linux-6.1/whitelist	1969-12-31 19:00:00.000000000 -0500
++++ kernel/whitelist	2023-05-25 07:48:40.279083833 -0400
+@@ -0,0 +1,30 @@
++src:*drivers/vhost/*
++src:*drivers/infiniband/*
++src:*drivers/media/v4l2-core*
++src:*arch/x86/kvm/*
++#src:*net/vmw_vsock/*
++#src:*net/netfilter/*
++src:*virt/kvm/*
++#src:*/net/*
++src:*kernel/bpf/*
++#src:*arch/x86/net/*
++src:*drivers/cdrom/*
++src:*drivers/scsi/*
++src:*drivers/nvme/*
++#src:*drivers/net/ppp/*
++src:*drivers/video/*
++src:*fs/autofs/*
++src:*ptmx*
++src:*drivers/tty*
++src:*fs/proc/proc_tty.c*
++src:*drivers/gpu/drm/*
++src:*drivers/parport/*
++src:*drivers/md/*
++src:*drivers/mmc/*
++src:*sound/*
++src:*io_uring*
++src:*fs/fuse/*
++src:*kernel/fuzzer_dev.c
++
++src:*drivers/android/*
++fun:*

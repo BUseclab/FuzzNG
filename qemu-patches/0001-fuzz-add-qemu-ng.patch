@@ -1,0 +1,1150 @@
+From 474af890082a91c45a16edccf197ee9e8d1d1c1c Mon Sep 17 00:00:00 2001
+From: Alexander Bulekov <alxndr@bu.edu>
+Date: Sun, 4 Jun 2023 09:51:49 -0400
+Subject: [PATCH] fuzz: add qemu-ng
+
+---
+ accel/kvm/kvm-all.c          |  39 +-
+ hw/i386/fuzz.c               | 728 +++++++++++++++++++++++++++++++++++
+ hw/i386/fuzz.h               |  73 ++++
+ hw/i386/meson.build          |   1 +
+ hw/i386/microvm.c            |   2 +
+ hw/i386/pc.c                 |   1 +
+ hw/isa/lpc_ich9.c            |   7 -
+ include/hw/i386/pc.h         |   1 +
+ meson.build                  |  11 -
+ migration/global_state.c     |   1 +
+ migration/savevm.c           |  22 +-
+ softmmu/runstate.c           |   5 +
+ target/i386/kvm/kvm.c        |   2 +-
+ tests/qtest/fuzz/fuzz.c      |   1 +
+ tests/qtest/fuzz/meson.build |  31 +-
+ 15 files changed, 871 insertions(+), 54 deletions(-)
+ create mode 100644 hw/i386/fuzz.c
+ create mode 100644 hw/i386/fuzz.h
+
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index cf3a88d90e..d13a63decf 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -623,6 +623,18 @@ static bool kvm_slot_get_dirty_log(KVMState *s, KVMSlot *slot)
+     return ret == 0;
+ }
+ 
++void kvm_slot_dirty_cb(void (*CB)(KVMSlot*));
++void kvm_slot_dirty_cb(void (*CB)(KVMSlot*))
++{
++    for (int i = 0; i < kvm_state->nr_slots; i++) {
++        KVMSlot *slot = &(kvm_state->memory_listener.slots[i]);
++        if(slot->memory_size){
++            kvm_slot_get_dirty_log(kvm_state, slot);
++            CB(slot);
++        }
++    }
++}
++
+ /* Should be with all slots_lock held for the address spaces. */
+ static void kvm_dirty_ring_mark_page(KVMState *s, uint32_t as_id,
+                                      uint32_t slot_id, uint64_t offset)
+@@ -715,6 +727,30 @@ static uint32_t kvm_dirty_ring_reap_one(KVMState *s, CPUState *cpu)
+     return count;
+ }
+ 
++uint32_t fuzz_kvm_dirty_ring_foreach(CPUState *cpu);
++uint32_t fuzz_kvm_dirty_ring_foreach(CPUState *cpu)
++{
++    struct kvm_dirty_gfn *dirty_gfns = cpu->kvm_dirty_gfns, *cur;
++    uint32_t ring_size = kvm_state->kvm_dirty_ring_size;
++    uint32_t count = 0, fetch = cpu->kvm_fetch_index;
++
++    assert(dirty_gfns && ring_size);
++
++    while (true) {
++        cur = &dirty_gfns[fetch % ring_size];
++        if (!dirty_gfn_is_dirtied(cur)) {
++            break;
++        }
++        dirty_gfn_set_collected(cur);
++        fetch++;
++        count++;
++    }
++    cpu->kvm_fetch_index = fetch;
++
++    return count;
++}
++
++
+ /* Must be with slots_lock held */
+ static uint64_t kvm_dirty_ring_reap_locked(KVMState *s, CPUState* cpu)
+ {
+@@ -2566,8 +2602,7 @@ static int kvm_init(MachineState *ms)
+      * guest pages.
+      */
+     if (!s->kvm_dirty_ring_size) {
+-        dirty_log_manual_caps =
+-            kvm_check_extension(s, KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2);
++        dirty_log_manual_caps = 0;
+         dirty_log_manual_caps &= (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE |
+                                   KVM_DIRTY_LOG_INITIALLY_SET);
+         s->manual_dirty_log_protect = dirty_log_manual_caps;
+diff --git a/hw/i386/fuzz.c b/hw/i386/fuzz.c
+new file mode 100644
+index 0000000000..eb5ab555c2
+--- /dev/null
++++ b/hw/i386/fuzz.c
+@@ -0,0 +1,728 @@
++/*
++ * QEMU Fuzzing Device
++ *
++ * Copyright (c) 2022 Alexander Bulekov
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "qemu/osdep.h"
++#include "fuzz.h"
++#include "exec/address-spaces.h"
++#include "hw/i386/pc.h"
++#include "io/channel-buffer.h"
++#include "migration/qemu-file.h"
++#include "migration/savevm.h"
++#include "sysemu/cpus.h"
++#include "sysemu/runstate.h"
++#include "sysemu/sysemu.h"
++#include "trace.h"
++#include <wordexp.h>
++
++#include <sys/mman.h>
++
++#include "sysemu/dma.h"
++
++__attribute__((section("__libfuzzer_extra_counters"))) unsigned char
++    libfuzzer_coverage[32 << 10];
++
++QEMUBH *qemu_fuzz_bh;
++GHashTable *seen_pcs;
++
++int fuzz_trace_pc;
++int fuzz_log_cmps;
++int fuzz_dump_output;
++int fuzz_log_syscalls;
++int fuzz_notimeout;
++int fuzz_print_all_pcs;
++
++static char *str0;
++static char *str1;
++
++static bool register_coverage_regions = 0;
++
++static sem_t wait_for_fuzzer;
++static sem_t wait_for_device;
++
++static void transpose_coverage(uint64_t **cmp, int index);
++
++int LLVMFuzzerTestOneInput(const unsigned char *Data, size_t Size);
++int LLVMFuzzerInitialize(int *argc, char ***argv, char ***envp);
++
++enum {
++    FUZZ_DEVICE_MAKE_SNAPSHOT = 0,
++    FUZZ_DEVICE_ADD_CMP_ARRAY = 12,
++    FUZZ_DEVICE_RESET = 16,
++    FUZZ_DEVICE_ADD_INPUT_REGION = 20,
++    FUZZ_DEVICE_GET_INPUT = 24,
++    FUZZ_DEVICE_ADD_OUTPUT_REGION = 28,
++    FUZZ_DEVICE_ADD_REMOTE_COV_ARRAY = 32,
++    FUZZ_DEVICE_ADD_PFN_BASE = 36,
++    FUZZ_DEVICE_ADD_PFN_SIZE = 40,
++    FUZZ_DEVICE_SHOW_TRACE = 44,
++    FUZZ_DEVICE_SET_KCOV_TIMER = 48,
++    FUZZ_DEVICE_ADD_SYSCALL_LOG = 52,
++    FUZZ_DEVICE_ADD_STR0 = 56,
++    FUZZ_DEVICE_ADD_STR1 = 60,
++    FUZZ_DEVICE_STRCMP = 64,
++    FUZZ_DEVICE_ABORT_INPUT = 68,
++    FUZZ_DEVICE_OPS_END
++};
++
++#define SAMPLE_RATE 9000000
++
++static QEMUTimer *earlyexit;
++static QEMUTimer *sampletimer;
++static uint8_t fuzz_input[8192];
++static size_t fuzz_input_size;
++
++static uint8_t *input_region;
++static uint8_t *output_region;
++
++typedef struct __attribute__((packed)) {
++    uint64_t id;
++    uint16_t start;
++    uint16_t end;
++    uint32_t runtime : 7;
++    uint32_t success : 1; // LSB set to 1 if success
++} log_entry;
++
++static void *syscall_log;
++
++static int memfd;
++
++// RAM Snapsot
++static size_t ramsize;
++static uint8_t *ram;
++static uint8_t *shadowram;
++
++// Device Snapshot
++static struct kvm_clock_data clockdata;
++static QIOChannelBuffer *ioc;
++
++// Coverage Regions
++static int cmp_array_index = 0;
++static uint64_t *cmp_arrays[1024];
++
++static int remote_cmp_array_index = 0;
++static uint64_t *remote_cmp_arrays[1024];
++
++static int ignore_cov = 0;
++static int resetdone = 0;
++
++
++static uint64_t timeout = 100000000;
++
++static void dump_output(void)
++{
++    if (!output_region)
++        return;
++    size_t output_size = *(size_t *)output_region;
++    uint8_t *output_data = output_region + sizeof(size_t);
++    for (int i = 0; i < output_size; i++) {
++        printf("\\x%02x", output_data[i]);
++    }
++    printf("\n");
++}
++
++static void memslot_cb(KVMSlot *slot)
++{
++    if (!(slot->ram >= (void *)ram &&
++          slot->ram <= (void *)(ram + ramsize)))
++        return;
++
++    uint64_t *bmap = slot->dirty_bmap;
++    uint64_t bitset;
++    for (size_t k = 0; k < slot->dirty_bmap_size / sizeof(*bmap); ++k) {
++        bitset = bmap[k];
++        while (bitset != 0) {
++            uint64_t t = bitset & -bitset;
++            int r = __builtin_ctzl(bitset);
++            uint64_t offset =
++                slot->start_addr +
++                (size_t)qemu_real_host_page_size() * (k * 64 + r);
++            memcpy(ram + offset, shadowram + offset,
++                   (size_t)qemu_real_host_page_size());
++            bitset ^= t;
++        }
++    }
++}
++
++void x86_cpu_dump_state(CPUState *cs, FILE *f, int flags);
++static void restore_vm(void)
++{
++    int ret;
++    QEMUFile *input_f;
++
++    if (!ioc) {
++        printf("Tried to restore with no snapshot..\n");
++        return;
++    }
++
++    clockdata.flags = 0;
++
++    ignore_cov = 0;
++    transpose_coverage(cmp_arrays, cmp_array_index);
++    transpose_coverage(remote_cmp_arrays, remote_cmp_array_index);
++
++    if (fuzz_dump_output) {
++        dump_output();
++    }
++
++    resetdone = 1;
++
++    if (output_region) {
++        __fuzzer_set_output(output_region + sizeof(size_t),
++                            *(size_t *)output_region);
++    }
++
++    if(syscall_log) {
++        __fuzzer_set_syscall_log(syscall_log);
++    }
++
++    kvm_slot_dirty_cb(memslot_cb);
++    ignore_cov = 0;
++
++    qio_channel_io_seek(QIO_CHANNEL(ioc), 0, 0, NULL);
++    input_f = qemu_file_new_input(QIO_CHANNEL(ioc));
++
++    // Read 64 bits form the snapshot to advance to the correct location
++    qemu_get_be32(input_f);
++    qemu_get_be32(input_f);
++    if (qemu_file_get_error(input_f)) {
++        printf("File Error\n");
++    }
++    ret = qemu_load_device_state(input_f);
++    g_free(input_f);
++
++    ret = kvm_vm_ioctl(kvm_state, KVM_SET_CLOCK, &clockdata);
++    if (ret < 0) {
++        fprintf(stderr, "KVM_SET_CLOCK failed: %s\n", strerror(-ret));
++        abort();
++    }
++}
++
++static void fuzz_reset_handler(void *opaque)
++{
++    timer_del(earlyexit);
++    printf("[RESET]\n");
++    pause_all_vcpus();
++    restore_vm();
++    resume_all_vcpus();
++}
++
++static void earlyexit_handler(void *opaque)
++{
++    if (fuzz_notimeout)
++        return;
++
++    pause_all_vcpus();
++    ignore_cov = 1;
++    restore_vm();
++    resume_all_vcpus();
++    timer_mod_ns(earlyexit,
++                 qemu_clock_get_ns(QEMU_CLOCK_HOST) + timeout);
++}
++
++static void crash_handler(void)
++{
++    if (!getenv("PRINT_CRASHES"))
++        return;
++
++    printf("Crashing Input: ");
++    for (int i = 0; i < fuzz_input_size; i++) {
++        printf("\\x%02x", fuzz_input[i]);
++    }
++    printf("\n");
++
++}
++
++size_t kcov_timer;
++uint64_t last_kcov;
++static void sample_handler(void *opaque)
++{
++    uint64_t timer_val = 0;
++
++    if (kcov_timer) {
++        dma_memory_read(&address_space_memory, kcov_timer, &timer_val,
++                        sizeof(timer_val), MEMTXATTRS_UNSPECIFIED);
++        if (timer_val && last_kcov && timer_val == last_kcov) {
++            printf("KCOV-TIMEOUT\n");
++            pause_all_vcpus();
++            ignore_cov = 1;
++            restore_vm();
++            resume_all_vcpus();
++        }
++        last_kcov = timer_val;
++    }
++    timer_mod_ns(sampletimer,
++                 qemu_clock_get_ns(QEMU_CLOCK_HOST) + SAMPLE_RATE);
++}
++
++static void snapport_write(void *opaque, hwaddr addr, uint64_t val,
++                           unsigned size)
++{
++    static int init;
++    QEMUFile *f;
++
++    if (!init) {
++        init++;
++        ram = qemu_ram_get_host_addr(
++            MACHINE(qdev_get_machine())->ram->ram_block);
++        ramsize = qemu_ram_get_used_length(
++            MACHINE(qdev_get_machine())->ram->ram_block);
++    }
++
++    if (!earlyexit) {
++        earlyexit =
++            timer_new_ns(QEMU_CLOCK_HOST, earlyexit_handler, NULL);
++    }
++
++    if (!sampletimer) {
++        sampletimer =
++            timer_new_ns(QEMU_CLOCK_HOST, sample_handler, NULL);
++        timer_mod_ns(sampletimer,
++                     qemu_clock_get_ns(QEMU_CLOCK_HOST) + SAMPLE_RATE);
++    }
++
++    switch (addr) {
++    case FUZZ_DEVICE_MAKE_SNAPSHOT:
++        cpu_synchronize_all_states();
++        if (ioc) {
++            break;
++        }
++
++        // Save the clock
++        int ret = kvm_vm_ioctl(kvm_state, KVM_GET_CLOCK, &clockdata);
++        if (ret < 0) {
++            fprintf(stderr, "KVM_GET_CLOCK failed: %s\n",
++                    strerror(-ret));
++            abort();
++        }
++
++        if (!memfd) {
++            memfd = memfd_create("RAM", 0);
++            if (memfd == -1) {
++                perror("memfd_create");
++                return;
++            }
++            ftruncate(memfd, ramsize);
++        }
++
++        // Save the Memory
++        shadowram = mmap(NULL, ramsize, PROT_READ | PROT_WRITE,
++                         MAP_SHARED, memfd, 0);
++        if (shadowram == MAP_FAILED) {
++            perror("mmap");
++            return;
++        }
++        memcpy(shadowram, (void *)ram, ramsize);
++
++        memory_global_dirty_log_start(GLOBAL_DIRTY_MIGRATION);
++
++        // Save the CPU + Devices
++        ioc = qio_channel_buffer_new(0x80000);
++        qio_channel_set_name(QIO_CHANNEL(ioc),
++                             "snapshot-loadvm-buffer");
++        f = qemu_file_new_output(QIO_CHANNEL(ioc));
++        ret = qemu_save_device_state(f);
++        printf("SAVEVM returned %d\n", ret);
++        qemu_fflush(f);
++        g_free(f);
++        vm_start();
++
++        break;
++    case FUZZ_DEVICE_ADD_CMP_ARRAY:
++        if (cmp_array_index == 0) {
++            printf("Adding KCOV Region @%lx\n", val);
++        }
++        cmp_arrays[cmp_array_index++] = (uint64_t *)(ram + val);
++        break;
++    case FUZZ_DEVICE_ADD_REMOTE_COV_ARRAY:
++        if (remote_cmp_array_index == 0) {
++            printf("Adding Remote KCOV Region @%lx\n", val);
++        }
++        remote_cmp_arrays[remote_cmp_array_index++] =
++            (uint64_t *)(ram + val);
++        break;
++    case FUZZ_DEVICE_ADD_INPUT_REGION:
++        printf("input at %lx\n", val);
++        input_region = ram + (size_t)val;
++        break;
++    case FUZZ_DEVICE_ADD_OUTPUT_REGION:
++        printf("output at %lx\n", val);
++        output_region = ram + (size_t)val;
++        break;
++    case FUZZ_DEVICE_RESET:
++        timer_del(earlyexit);
++        restore_vm();
++        break;
++    case FUZZ_DEVICE_GET_INPUT:
++        if (!resetdone) {
++            transpose_coverage(cmp_arrays, cmp_array_index);
++            transpose_coverage(remote_cmp_arrays,
++                               remote_cmp_array_index);
++        }
++        sem_post(&wait_for_device);
++        resetdone = 0;
++        sem_wait(&wait_for_fuzzer);
++        timer_mod_ns(earlyexit,
++                     qemu_clock_get_ns(QEMU_CLOCK_HOST) + timeout);
++        memcpy(input_region, &fuzz_input_size, sizeof(fuzz_input_size));
++        memcpy(input_region + sizeof(fuzz_input_size), fuzz_input,
++               fuzz_input_size);
++        break;
++    case FUZZ_DEVICE_ADD_PFN_BASE:
++        break;
++    case FUZZ_DEVICE_ADD_PFN_SIZE:
++        break;
++    case FUZZ_DEVICE_SHOW_TRACE:
++        crash_handler();
++        timer_del(earlyexit);
++        restore_vm();
++        break;
++    case FUZZ_DEVICE_SET_KCOV_TIMER:
++        printf("KCOV Physaddr set to %lx\n", val);
++        kcov_timer = val;
++        break;
++    case FUZZ_DEVICE_ADD_SYSCALL_LOG:
++        printf("log at %lx\n", val);
++        syscall_log = ram + (size_t)val;
++        break;
++    case FUZZ_DEVICE_ADD_STR0:
++        printf("str0 at %lx\n", val);
++        str0 = (char*)ram + (size_t)val;
++        break;
++    case FUZZ_DEVICE_ADD_STR1:
++        printf("str1 at %lx\n", val);
++        str1 = (char*)ram + (size_t)val;
++        break;
++    case FUZZ_DEVICE_STRCMP:
++        __sanitizer_hook_strcmp_ng((void *)val, str0, str1, 1);
++        break;
++    case FUZZ_DEVICE_ABORT_INPUT:
++        ignore_cov = 1;
++        timer_del(earlyexit);
++        restore_vm();
++        break;
++    }
++}
++
++static uint64_t snapport_read(void *opaque, hwaddr addr, unsigned size)
++{
++
++    switch (addr) {
++    case 0:
++        if (fuzz_trace_pc) {
++            return 1;
++        } else {
++            return 0;
++        }
++        break;
++    case 4:
++        if (getenv("FUZZ_ABORT_ERRORS")) {
++            return 1;
++        } else {
++            return 0;
++        }
++        break;
++    }
++    return 0;
++}
++
++static void snapport_reset(DeviceState *d) {}
++
++static const MemoryRegionOps snapport_ops = {
++    .read = snapport_read,
++    .write = snapport_write,
++    .impl =
++        {
++            .min_access_size = 4,
++            .max_access_size = 4,
++        },
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void fuzzpage_write(void *opaque, hwaddr addr, uint64_t val,
++                           unsigned size)
++{
++    return;
++}
++
++static uint64_t fuzzpage_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return 1;
++}
++
++static const MemoryRegionOps fuzzpage_ops = {
++    .read = fuzzpage_read,
++    .write = fuzzpage_write,
++    .impl =
++        {
++            .min_access_size = 1,
++            .max_access_size = 8,
++        },
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void snapport_initfn(Object *obj)
++{
++    SnapportState *s = FUZZPORT(obj);
++
++    memory_region_init_io(&(s->io_snap), OBJECT(s), &snapport_ops, s,
++                          "snapport", FUZZ_DEVICE_OPS_END);
++    memory_region_init_io(&(s->io_fuzz), OBJECT(s), &fuzzpage_ops, s,
++                          "fuzzpage", 4096);
++}
++
++static void snapport_realizefn(DeviceState *dev, Error **errp)
++{
++    ISADevice *isadev = ISA_DEVICE(dev);
++    SnapportState *s = FUZZPORT(dev);
++
++    isa_register_ioport(isadev, &(s->io_snap), 0x922);
++}
++
++static void snapport_class_initfn(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = snapport_realizefn;
++    dc->reset = snapport_reset;
++    dc->user_creatable = false;
++}
++
++static const TypeInfo snapport_info = {
++    .name = TYPE_FUZZPORT,
++    .parent = TYPE_ISA_DEVICE,
++    .instance_size = sizeof(SnapportState),
++    .instance_init = snapport_initfn,
++    .class_init = snapport_class_initfn,
++};
++
++static void snapport_register_types(void)
++{
++    type_register_static(&snapport_info);
++}
++
++static void *work(void *pthread_param)
++{
++    wordexp_t result;
++
++    if (getenv("TIMEOUT"))
++        timeout = atol(getenv("TIMEOUT"));
++
++    GString *cmd_line = g_string_new(TARGET_NAME);
++    g_string_append_printf(cmd_line, " %s", getenv("QEMU_SNAP_ARGS"));
++    printf("cmd_line: %s\n", cmd_line->str);
++    wordexp(cmd_line->str, &result, 0);
++    for (int i = 0; i < result.we_wordc; i++)
++        printf("cmd_line[%d]: %s\n", i, result.we_wordv[i]);
++    g_string_free(cmd_line, true);
++    qemu_init(result.we_wordc, result.we_wordv);
++    qemu_main_loop();
++    qemu_cleanup();
++    exit(0);
++    return NULL;
++}
++
++int LLVMFuzzerTestOneInput(const unsigned char *Data, size_t Size)
++{
++    // Mutate the input and copy data into guest
++    // fuzz_input = Data;
++    memcpy(fuzz_input, Data, Size);
++    fuzz_input_size = Size;
++    last_kcov = 0;
++
++    sem_post(&wait_for_fuzzer);
++    sem_wait(&wait_for_device);
++    return 0;
++}
++
++int LLVMFuzzerInitialize(int *argc, char ***argv, char ***envp)
++{
++    fuzz_trace_pc = getenv("FUZZ_TRACE_PC") != NULL;
++    fuzz_log_cmps = getenv("FUZZ_LOG_CMPS") != NULL;
++    fuzz_log_syscalls = getenv("FUZZ_LOG_SYSCALLS") != NULL;
++    fuzz_print_all_pcs = getenv("PRINT_ALL_PCS") != NULL;
++    fuzz_dump_output = getenv("DUMP_OUTPUT") != NULL;
++    fuzz_notimeout = getenv("NOTIMEOUT") != NULL;
++    seen_pcs = g_hash_table_new(NULL, NULL);
++
++    sem_init(&wait_for_device, 0, 0);
++    sem_init(&wait_for_fuzzer, 0, 0);
++
++    pthread_t main_thread;
++    pthread_create(&main_thread, NULL, work, NULL);
++    sem_wait(&wait_for_device);
++    qemu_fuzz_bh = qemu_bh_new(fuzz_reset_handler, NULL);
++    return 0;
++}
++
++static void dump_cmp_cov_section(uint64_t pc, uint64_t *switches,
++                                 uint64_t val)
++{
++    if (switches[0] == 1) {
++        if (fuzz_log_cmps)
++            printf("CMP: %lx %lx @%lx\n", switches[2], val, pc);
++
++        uint64_t arg1 = val;
++        uint64_t arg2 = switches[2];
++
++        // Inspired by Syzkaller, filter out kernel physical memory addresses.
++        // These are internal kernel comparisons and should not be
++        // interesting. The range covers first 1TB of physical mapping.
++        uint64_t kmem_start = (uint64_t)0xffff880000000000ull;
++        uint64_t kmem_end = (uint64_t)0xffff890000000000ull;
++        bool kptr1 = arg1 >= kmem_start && arg1 <= kmem_end;
++        bool kptr2 = arg2 >= kmem_start && arg2 <= kmem_end;
++        if (kptr1 && kptr2)
++            return;
++        if (kptr1 && arg2 == 0)
++            return;
++        if (kptr2 && arg1 == 0)
++            return;
++
++        if (switches[1] == 64) {
++            __sanitizer_cov_trace_cmp8_pc(pc, (uint64_t)switches[2],
++                                          val);
++        } else if (switches[1] == 32) {
++            __sanitizer_cov_trace_cmp4_pc(pc, (uint32_t)switches[2],
++                                          val);
++        } else if (switches[1] == 16) {
++            __sanitizer_cov_trace_cmp2_pc(pc, (uint16_t)switches[2],
++                                          val);
++        } else if (switches[1] == 8) {
++            __sanitizer_cov_trace_cmp1_pc(pc, (uint8_t)switches[2],
++                                          val);
++        }
++    } else {
++        if (fuzz_log_cmps) {
++            printf("SWITCH: %lx vs [ ", val);
++            for (int i = 0; i < switches[0]; i++) {
++                printf("%lx ", switches[2 + i]);
++            }
++            printf("] @%lx\n", pc);
++        }
++        __sanitizer_cov_trace_switch_pc(pc, val, switches);
++    }
++}
++
++static void transpose_coverage(uint64_t **cmp, int index)
++{
++    uint64_t ncov;
++    /*
++     * The array is contiguous in the guest's virtual memory, but not in
++     * physical memory. Thus, we keep it split up in individual
++     * page-sized chunks, where the first element of the first array
++     * indicates the number of coverage elements.
++     */
++    if (!index)
++        return;
++    ncov = __atomic_load_n(&cmp[0][0], __ATOMIC_RELAXED);
++    if (!ncov)
++        ncov++;
++
++    if (fuzz_trace_pc) {
++        for (int i = 0; i < ncov; i++) {
++            int base = i + 1;
++            uint64_t pc = __atomic_load_n(
++                &cmp[base / (PAGESIZE / sizeof(uint64_t))]
++                    [base % (PAGESIZE / sizeof(uint64_t))],
++                __ATOMIC_RELAXED);
++            pc |= 0xFFFFFFFFLL << 32;
++            if (g_hash_table_insert(seen_pcs, (gpointer)pc,
++                                    (gpointer)1) ||
++                fuzz_print_all_pcs) {
++                if (cmp == remote_cmp_arrays) {
++                    printf("[%ld] NEW_PC_REMOTE: %lx\n", time(NULL),
++                           pc - 5);
++                } else
++                    printf("[%ld] NEW_PC: %lx\n", time(NULL), pc - 5);
++            }
++            if (!ignore_cov)
++                libfuzzer_coverage[pc % sizeof(libfuzzer_coverage)]++;
++        }
++    } else {
++        assert(ncov * KCOV_WORDS_PER_CMP * sizeof(uint64_t) <=
++               PAGESIZE * index - 1);
++        uint64_t prior_pc = 0;
++        uint64_t prior_val;
++        uint64_t switches[1000];
++        switches[0] = 0;
++        for (int i = 0; i < ncov && !ignore_cov; i++) {
++            int base = i * KCOV_WORDS_PER_CMP;
++            uint64_t type = __atomic_load_n(
++                &cmp[(base + 1) / (PAGESIZE / sizeof(uint64_t))]
++                    [(base + 1) % (PAGESIZE / sizeof(uint64_t))],
++                __ATOMIC_RELAXED);
++            uint64_t arg1 = __atomic_load_n(
++                &cmp[(base + 2) / (PAGESIZE / sizeof(uint64_t))]
++                    [(base + 2) % (PAGESIZE / sizeof(uint64_t))],
++                __ATOMIC_RELAXED);
++            uint64_t arg2 = __atomic_load_n(
++                &cmp[(base + 3) / (PAGESIZE / sizeof(uint64_t))]
++                    [(base + 3) % (PAGESIZE / sizeof(uint64_t))],
++                __ATOMIC_RELAXED);
++            uint64_t pc = __atomic_load_n(
++                &cmp[(base + 4) / (PAGESIZE / sizeof(uint64_t))]
++                    [(base + 4) % (PAGESIZE / sizeof(uint64_t))],
++                __ATOMIC_RELAXED);
++            uint64_t argsize = 1 << ((type & KCOV_CMP_MASK) >> 1);
++            uint64_t is_const = type & KCOV_CMP_CONST;
++
++            if (i == 0 ||
++                (prior_pc == pc && is_const &&
++                 (switches[2] !=
++                  arg1))) { // Make sure we aren't just hitting the same
++                            // CMP twice in a row
++                switches[2 + switches[0]] =
++                    arg1; // kcov always places the switch into the
++                          // first arg1
++                switches[1] = argsize * 8;
++                switches[0]++;
++            } else {
++                // dump out the prior data
++                dump_cmp_cov_section(prior_pc, switches, prior_val);
++                switches[0] = 0;
++                switches[1] = argsize * 8;
++                switches[2 + switches[0]] = arg1;
++                switches[0]++;
++            }
++            prior_pc = pc;
++            prior_val = arg2;
++
++            if (g_hash_table_insert(seen_pcs, (gpointer)pc,
++                                    (gpointer)1) ||
++                fuzz_print_all_pcs) {
++                if (cmp == remote_cmp_arrays)
++                    printf("NEW_PC_REMOTE: %lx\n", pc - 5);
++                else
++                    printf("NEW_PC: %lx\n", pc - 5);
++            }
++            libfuzzer_coverage[pc % sizeof(libfuzzer_coverage)]++;
++        }
++        if (ncov && !ignore_cov) {
++            dump_cmp_cov_section(prior_pc, switches, prior_val);
++        }
++    }
++    __atomic_store_n(&cmp[0][0], 0, __ATOMIC_RELAXED);
++}
++
++void __wrap___sanitizer_cov_pcs_init(const uintptr_t *pcs_beg,
++                                     const uintptr_t *pcs_end)
++{
++    if (register_coverage_regions)
++        __real___sanitizer_cov_pcs_init(pcs_beg, pcs_end);
++    return;
++}
++
++void __wrap___sanitizer_cov_8bit_counters_init(uint8_t *Start,
++                                               uint8_t *Stop)
++{
++    if (register_coverage_regions)
++        __real___sanitizer_cov_8bit_counters_init(Start, Stop);
++    return;
++}
++
++type_init(snapport_register_types)
+diff --git a/hw/i386/fuzz.h b/hw/i386/fuzz.h
+new file mode 100644
+index 0000000000..516d347140
+--- /dev/null
++++ b/hw/i386/fuzz.h
+@@ -0,0 +1,73 @@
++#ifndef FUZZ_H
++#define FUZZ_H
++
++#include "qemu/osdep.h"
++#include "hw/i386/pc.h"
++#include "sysemu/kvm.h"
++#include "sysemu/kvm_int.h"
++
++#include <stdint.h>
++
++#define PAGESIZE 0x1000
++
++
++#define FUZZPORT(obj) OBJECT_CHECK(SnapportState, (obj), TYPE_FUZZPORT)
++
++#define DEBUG 0
++#define debug_printf(fmt, ...)                                         \
++    do {                                                               \
++        if (DEBUG) {                                                   \
++            printf(fmt, __VA_ARGS__);                                  \
++            fflush(stdout);                                            \
++        }                                                              \
++    } while (0)
++
++void __sanitizer_hook_strcmp_ng(void *caller_pc, const char *s1,
++                                const char *s2, int result);
++
++void __sanitizer_cov_trace_cmp8_pc(uint64_t PC, uint64_t Arg1,
++                                   uint64_t Arg2);
++void __sanitizer_cov_trace_cmp4_pc(uint64_t PC, uint32_t Arg1,
++                                   uint32_t Arg2);
++void __sanitizer_cov_trace_cmp2_pc(uint64_t PC, uint16_t Arg1,
++                                   uint16_t Arg2);
++void __sanitizer_cov_trace_cmp1_pc(uint64_t PC, uint8_t Arg1,
++                                   uint8_t Arg2);
++void __sanitizer_cov_trace_switch_pc(uint64_t PC, uint64_t Val,
++                                     uint64_t *Cases);
++void __fuzzer_set_output(uint8_t *data, size_t size);
++void __fuzzer_set_syscall_log(void *log);
++
++#define KCOV_WORDS_PER_CMP 4
++#define KCOV_CMP_SIZE(n)        ((n) << 1)
++#define KCOV_CMP_MASK           KCOV_CMP_SIZE(3)
++
++#define KCOV_CMP_CONST          (1 << 0)
++#define KCOV_CMP_SIZE(n)        ((n) << 1)
++#define KCOV_CMP_MASK           KCOV_CMP_SIZE(3)
++ 
++void __real___sanitizer_cov_pcs_init(const uintptr_t *pcs_beg,
++                                     const uintptr_t *pcs_end);
++void __real___sanitizer_cov_8bit_counters_init(uint8_t *Start, uint8_t *Stop);
++
++void __wrap___sanitizer_cov_pcs_init(const uintptr_t *pcs_beg,
++                                     const uintptr_t *pcs_end);
++void __wrap___sanitizer_cov_8bit_counters_init(uint8_t *Start, uint8_t *Stop);
++
++void __sanitizer_cov_8bit_counters_init(char *start, char *end);
++
++void __sanitizer_cov_trace_cmp2(uint16_t, uint16_t);
++void __sanitizer_cov_trace_cmp4(uint32_t, uint32_t);
++void __sanitizer_cov_trace_cmp8(uint64_t, uint64_t);
++
++void kvm_slot_dirty_cb(void (*CB)(KVMSlot *));
++
++typedef struct SnapportState {
++    ISADevice parent_obj;
++
++    MemoryRegion io_snap;
++    MemoryRegion io_fuzz;
++} SnapportState;
++
++
++#endif
+diff --git a/hw/i386/meson.build b/hw/i386/meson.build
+index 213e2e82b3..3a2d076c5f 100644
+--- a/hw/i386/meson.build
++++ b/hw/i386/meson.build
+@@ -5,6 +5,7 @@ i386_ss.add(files(
+   'e820_memory_layout.c',
+   'multiboot.c',
+   'x86.c',
++  'fuzz.c',
+ ))
+ 
+ i386_ss.add(when: 'CONFIG_X86_IOMMU', if_true: files('x86-iommu.c'),
+diff --git a/hw/i386/microvm.c b/hw/i386/microvm.c
+index 3d606a20b4..019fd71902 100644
+--- a/hw/i386/microvm.c
++++ b/hw/i386/microvm.c
+@@ -49,6 +49,7 @@
+ #include "hw/acpi/generic_event_device.h"
+ #include "hw/pci-host/gpex.h"
+ #include "hw/usb/xhci.h"
++#include "hw/i386/pc.h"
+ 
+ #include "elf.h"
+ #include "kvm/kvm_i386.h"
+@@ -174,6 +175,7 @@ static void microvm_devices_init(MicrovmMachineState *mms)
+     isa_bus = isa_bus_new(NULL, get_system_memory(), get_system_io(),
+                           &error_abort);
+     isa_bus_register_input_irqs(isa_bus, x86ms->gsi);
++    isa_create_simple(isa_bus, TYPE_FUZZPORT);
+ 
+     ioapic_init_gsi(gsi_state, "machine");
+     if (ioapics > 1) {
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 1489abf010..d75d3e6912 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -1252,6 +1252,7 @@ static void pc_superio_init(ISABus *isa_bus, bool create_fdctrl,
+         isa_realize_and_unref(vmmouse, isa_bus, &error_fatal);
+     }
+     port92 = isa_create_simple(isa_bus, TYPE_PORT92);
++    isa_create_simple(isa_bus, TYPE_FUZZPORT);
+ 
+     a20_line = qemu_allocate_irqs(handle_a20_line_change, first_cpu, 2);
+     i8042_setup_a20_line(i8042, a20_line[0]);
+diff --git a/hw/isa/lpc_ich9.c b/hw/isa/lpc_ich9.c
+index 9714b0001e..7f685cd83d 100644
+--- a/hw/isa/lpc_ich9.c
++++ b/hw/isa/lpc_ich9.c
+@@ -498,16 +498,9 @@ ich9_lpc_pmbase_sci_update(ICH9LPCState *lpc)
+ /* config:RCBA */
+ static void ich9_lpc_rcba_update(ICH9LPCState *lpc, uint32_t rcba_old)
+ {
+-    uint32_t rcba = pci_get_long(lpc->d.config + ICH9_LPC_RCBA);
+-
+     if (rcba_old & ICH9_LPC_RCBA_EN) {
+         memory_region_del_subregion(get_system_memory(), &lpc->rcrb_mem);
+     }
+-    if (rcba & ICH9_LPC_RCBA_EN) {
+-        memory_region_add_subregion_overlap(get_system_memory(),
+-                                            rcba & ICH9_LPC_RCBA_BA_MASK,
+-                                            &lpc->rcrb_mem, 1);
+-    }
+ }
+ 
+ /* config:GEN_PMCON* */
+diff --git a/include/hw/i386/pc.h b/include/hw/i386/pc.h
+index 8206d5405a..9de16e2dcf 100644
+--- a/include/hw/i386/pc.h
++++ b/include/hw/i386/pc.h
+@@ -179,6 +179,7 @@ void pc_i8259_create(ISABus *isa_bus, qemu_irq *i8259_irqs);
+ #define PORT92_A20_LINE "a20"
+ 
+ #define TYPE_PORT92 "port92"
++#define TYPE_FUZZPORT "fuzzport"
+ 
+ /* pc_sysfw.c */
+ void pc_system_flash_create(PCMachineState *pcms);
+diff --git a/meson.build b/meson.build
+index c44d05a13f..fc5bb8cb05 100644
+--- a/meson.build
++++ b/meson.build
+@@ -217,17 +217,6 @@ endif
+ if get_option('fuzzing')
+   # Specify a filter to only instrument code that is directly related to
+   # virtual-devices.
+-  configure_file(output: 'instrumentation-filter',
+-                 input: 'scripts/oss-fuzz/instrumentation-filter-template',
+-                 copy: true)
+-
+-  if cc.compiles('int main () { return 0; }',
+-                  name: '-fsanitize-coverage-allowlist=/dev/null',
+-                 args: ['-fsanitize-coverage-allowlist=/dev/null',
+-                        '-fsanitize-coverage=trace-pc'] )
+-    add_global_arguments('-fsanitize-coverage-allowlist=instrumentation-filter',
+-                         native: false, language: all_languages)
+-  endif
+ 
+   if get_option('fuzzing_engine') == ''
+     # Add CFLAGS to tell clang to add fuzzer-related instrumentation to all the
+diff --git a/migration/global_state.c b/migration/global_state.c
+index a33947ca32..bc0a5ad494 100644
+--- a/migration/global_state.c
++++ b/migration/global_state.c
+@@ -87,6 +87,7 @@ static int global_state_post_load(void *opaque, int version_id)
+     int r;
+     char *runstate = (char *)s->runstate;
+ 
++    return 0;
+     s->received = true;
+     trace_migrate_global_state_post_load(runstate);
+ 
+diff --git a/migration/savevm.c b/migration/savevm.c
+index aa54a67fda..40190342ab 100644
+--- a/migration/savevm.c
++++ b/migration/savevm.c
+@@ -1600,7 +1600,8 @@ void qemu_savevm_state_cleanup(void)
+     }
+ }
+ 
+-static int qemu_savevm_state(QEMUFile *f, Error **errp)
++int qemu_savevm_state(QEMUFile *f, Error **errp);
++int qemu_savevm_state(QEMUFile *f, Error **errp)
+ {
+     int ret;
+     MigrationState *ms = migrate_get_current();
+@@ -1679,6 +1680,20 @@ int qemu_save_device_state(QEMUFile *f)
+         if (se->is_ram) {
+             continue;
+         }
++        /* if ((!se->ops || !se->ops->save_state) && !se->vmsd) { */
++        /*     continue; */
++        /* } */
++        /* if (se->vmsd && !vmstate_save_needed(se->vmsd, se->opaque)) { */
++        /*     continue; */
++        /* } */
++        if(strstr(se->idstr, "virtio"))
++            continue;
++        if(strstr(se->idstr, "nvme"))
++            continue;
++        if(strstr(se->idstr, "sd-card"))
++            continue;
++        printf("Saving Device: %s \n", se->idstr);
++
+         ret = vmstate_save(f, se, NULL);
+         if (ret) {
+             return ret;
+@@ -2698,9 +2713,8 @@ int qemu_loadvm_state_main(QEMUFile *f, MigrationIncomingState *mis)
+ retry:
+     while (true) {
+         section_type = qemu_get_byte(f);
+-
+-        ret = qemu_file_get_error_obj_any(f, mis->postcopy_qemufile_dst, NULL);
+-        if (ret) {
++        if (qemu_file_get_error(f)) {
++            ret = qemu_file_get_error(f);
+             break;
+         }
+ 
+diff --git a/softmmu/runstate.c b/softmmu/runstate.c
+index d1e04586db..8d6c582fb2 100644
+--- a/softmmu/runstate.c
++++ b/softmmu/runstate.c
+@@ -523,8 +523,13 @@ void qemu_system_guest_crashloaded(GuestPanicInformation *info)
+     qapi_free_GuestPanicInformation(info);
+ }
+ 
++
++extern QEMUBH *qemu_fuzz_bh;
++
+ void qemu_system_reset_request(ShutdownCause reason)
+ {
++    qemu_bh_schedule(qemu_fuzz_bh);
++    return;
+     if (reboot_action == REBOOT_ACTION_SHUTDOWN &&
+         reason != SHUTDOWN_CAUSE_SUBSYSTEM_RESET) {
+         shutdown_requested = reason;
+diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
+index de531842f6..29b2b48ce1 100644
+--- a/target/i386/kvm/kvm.c
++++ b/target/i386/kvm/kvm.c
+@@ -4732,7 +4732,7 @@ int kvm_arch_put_registers(CPUState *cpu, int level)
+     /* must be before kvm_put_nested_state so that EFER.SVME is set */
+     ret = has_sregs2 ? kvm_put_sregs2(x86_cpu) : kvm_put_sregs(x86_cpu);
+     if (ret < 0) {
+-        return ret;
++        /* return ret; */
+     }
+ 
+     if (level >= KVM_PUT_RESET_STATE) {
+diff --git a/tests/qtest/fuzz/fuzz.c b/tests/qtest/fuzz/fuzz.c
+index 3bedb81b32..a2212f8b9e 100644
+--- a/tests/qtest/fuzz/fuzz.c
++++ b/tests/qtest/fuzz/fuzz.c
+@@ -45,6 +45,7 @@ static QTestState *fuzz_qts;
+ 
+ void flush_events(QTestState *s)
+ {
++    return;
+     int i = MAX_EVENT_LOOPS;
+     while (g_main_context_pending(NULL) && i-- > 0) {
+         main_loop_wait(false);
+diff --git a/tests/qtest/fuzz/meson.build b/tests/qtest/fuzz/meson.build
+index 4d10b47b8f..89ea2c8812 100644
+--- a/tests/qtest/fuzz/meson.build
++++ b/tests/qtest/fuzz/meson.build
+@@ -2,37 +2,10 @@ if not get_option('fuzzing')
+   subdir_done()
+ endif
+ 
+-specific_fuzz_ss.add(files('fuzz.c', 'qos_fuzz.c',
+-                           'qtest_wrappers.c'), qos)
+-
+-# Targets
+-specific_fuzz_ss.add(when: 'CONFIG_I440FX', if_true: files('i440fx_fuzz.c'))
+-specific_fuzz_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('virtio_net_fuzz.c'))
+-specific_fuzz_ss.add(when: 'CONFIG_VIRTIO_SCSI', if_true: files('virtio_scsi_fuzz.c'))
+-specific_fuzz_ss.add(when: 'CONFIG_VIRTIO_BLK', if_true: files('virtio_blk_fuzz.c'))
+-specific_fuzz_ss.add(files('generic_fuzz.c'))
+-
+ fuzz_ld = declare_dependency(
+   link_args: fuzz_exe_ldflags +
+-             ['-Wl,-wrap,qtest_inb',
+-              '-Wl,-wrap,qtest_inw',
+-              '-Wl,-wrap,qtest_inl',
+-              '-Wl,-wrap,qtest_outb',
+-              '-Wl,-wrap,qtest_outw',
+-              '-Wl,-wrap,qtest_outl',
+-              '-Wl,-wrap,qtest_readb',
+-              '-Wl,-wrap,qtest_readw',
+-              '-Wl,-wrap,qtest_readl',
+-              '-Wl,-wrap,qtest_readq',
+-              '-Wl,-wrap,qtest_writeb',
+-              '-Wl,-wrap,qtest_writew',
+-              '-Wl,-wrap,qtest_writel',
+-              '-Wl,-wrap,qtest_writeq',
+-              '-Wl,-wrap,qtest_memread',
+-              '-Wl,-wrap,qtest_bufread',
+-              '-Wl,-wrap,qtest_memwrite',
+-              '-Wl,-wrap,qtest_bufwrite',
+-              '-Wl,-wrap,qtest_memset']
++             ['-Wl,-wrap,__sanitizer_cov_pcs_init',
++              '-Wl,-wrap,__sanitizer_cov_8bit_counters_init']
+ )
+ 
+ specific_fuzz_ss.add(fuzz_ld)
+-- 
+2.39.0
+
